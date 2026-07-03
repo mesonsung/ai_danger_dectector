@@ -24,7 +24,7 @@ class HandDetector:
     def __init__(self, model_path: str, min_confidence: float = 0.5):
         options = vision.HandLandmarkerOptions(
             base_options=python.BaseOptions(model_asset_path=model_path),
-            running_mode=vision.RunningMode.IMAGE,
+            running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
             min_hand_detection_confidence=min_confidence,
             min_hand_presence_confidence=min_confidence,
@@ -32,11 +32,11 @@ class HandDetector:
         )
         self.landmarker = vision.HandLandmarker.create_from_options(options)
 
-    def detect(self, frame_bgr: np.ndarray) -> list[HandDetection]:
+    def detect(self, frame_bgr: np.ndarray, timestamp_ms: int) -> list[HandDetection]:
         h, w = frame_bgr.shape[:2]
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
-        result = self.landmarker.detect(mp_image)
+        result = self.landmarker.detect_for_video(mp_image, timestamp_ms)
 
         hands: list[HandDetection] = []
         if not result.hand_landmarks:

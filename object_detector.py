@@ -6,10 +6,12 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
 from ultralytics import YOLO
 
 from config import (
+    DETECTION_MAX_WIDTH,
     EXCLUDED_WEAPON_LABELS,
     HAND_WEAPON_IOU_THRESHOLD,
     WEAPON_IMGSZ,
@@ -52,6 +54,18 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     return inter / (area_a + area_b - inter)
 
 
+def _scale_bbox(bbox: tuple[int, int, int, int], inv_scale: float) -> tuple[int, int, int, int]:
+    if inv_scale == 1.0:
+        return bbox
+    x1, y1, x2, y2 = bbox
+    return (
+        int(x1 * inv_scale),
+        int(y1 * inv_scale),
+        int(x2 * inv_scale),
+        int(y2 * inv_scale),
+    )
+
+
 class ObjectDetector:
     """偵測手部與危險物品，以 bounding box 重疊判斷是否手持"""
 
@@ -72,9 +86,41 @@ class ObjectDetector:
         self.weapon_model = YOLO(str(weapon_path))
         self.hand_detector = HandDetector(str(hand_path), min_confidence=conf)
         self.conf = conf
+        self._device = self._resolve_device()
+        logger.info("YOLO 推論裝置: %s", self._device)
 
-    def _detect_weapons(self, frame: np.ndarray) -> list[WeaponDetection]:
-        results = self.weapon_model(frame, conf=self.conf, imgsz=WEAPON_IMGSZ, verbose=False)
+    @staticmethod
+    def _resolve_device() -> str | int:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return 0
+        except ImportError:
+            pass
+        return "cpu"
+
+    def _prepare_infer_frame(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
+        h, w = frame.shape[:2]
+        max_w = DETECTION_MAX_WIDTH
+        if max_w and w > max_w:
+            scale = max_w / w
+            infer = cv2.resize(
+                frame,
+                (max_w, int(h * scale)),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            return infer, scale
+        return frame, 1.0
+
+    def _detect_weapons(self, frame: np.ndarray, inv_scale: float) -> list[WeaponDetection]:
+        results = self.weapon_model(
+            frame,
+            conf=self.conf,
+            imgsz=WEAPON_IMGSZ,
+            device=self._device,
+            verbose=False,
+        )
         weapons: list[WeaponDetection] = []
         for result in results:
             if result.boxes is None:
@@ -87,14 +133,30 @@ class ObjectDetector:
                     continue
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                weapons.append(WeaponDetection(label=label, confidence=conf, bbox=(x1, y1, x2, y2)))
+                bbox = _scale_bbox((x1, y1, x2, y2), inv_scale)
+                weapons.append(WeaponDetection(label=label, confidence=conf, bbox=bbox))
         return weapons
 
     def detect(
-        self, frame: np.ndarray,
+        self,
+        frame: np.ndarray,
+        timestamp_ms: int,
     ) -> tuple[list[HandDetection], list[WeaponDetection], list[DangerousPerson]]:
-        hands = self.hand_detector.detect(frame)
-        weapons = self._detect_weapons(frame)
+        infer_frame, scale = self._prepare_infer_frame(frame)
+        inv_scale = 1.0 / scale
+
+        hands = self.hand_detector.detect(infer_frame, timestamp_ms)
+        if inv_scale != 1.0:
+            hands = [
+                HandDetection(
+                    label=hand.label,
+                    confidence=hand.confidence,
+                    bbox=_scale_bbox(hand.bbox, inv_scale),
+                )
+                for hand in hands
+            ]
+
+        weapons = self._detect_weapons(infer_frame, inv_scale)
         dangerous = self._match_hand_weapon(hands, weapons)
         return hands, weapons, dangerous
 

@@ -8,16 +8,22 @@
 2. **危險物品偵測**：公開 YOLO 模型（Hugging Face）偵測刀、槍等
 3. **空間關聯**：危險物品 bbox 與手部 bbox **IoU 重疊** → 判定為危險
 
-## Web UI 啟動
+## Web UI 啟動（Streamlit）
 
 ```bash
 uv sync
 uv run python web_app.py
 ```
 
+或：
+
+```bash
+uv run streamlit run web_app.py --server.port 8080
+```
+
 瀏覽器開啟：**http://localhost:8080**
 
-- 左側：即時 MJPEG 影像串流（含偵測框）
+- 左側：即時影像（含偵測框）
 - 右側：FPS、手部/危險物品數量、警報紀錄
 
 ## 本機 OpenCV 視窗模式

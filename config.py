@@ -1,5 +1,6 @@
 """系統設定"""
 
+import sys
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).parent
@@ -11,14 +12,21 @@ HAND_MODEL = ROOT_DIR / "models" / "hand_landmarker.task"
 # 視訊來源：0 = 預設 webcam，或填入影片/RTSP 路徑
 VIDEO_SOURCE = 0
 
-# 每 N 幀執行一次偵測
-DETECT_INTERVAL = 2
+# 擷取解析度
+CAPTURE_WIDTH = 1280
+CAPTURE_HEIGHT = 720
+
+# 推論用影像最大寬度（縮小後再偵測，bbox 會映射回原始尺寸）
+DETECTION_MAX_WIDTH = 320
+
+# 兩次偵測之間最短間隔（毫秒）
+DETECTION_MIN_INTERVAL_MS = 120
 
 # 偵測信心度閾值
 DETECTION_CONF = 0.4
 
-# 危險物品模型推論尺寸（SyncRobotic 模型建議 960）
-WEAPON_IMGSZ = 960
+# 危險物品模型推論尺寸（640 較快，960 較準）
+WEAPON_IMGSZ = 320
 
 # 手部與危險物品 bounding box 的 IoU 閾值
 HAND_WEAPON_IOU_THRESHOLD = 0.01
@@ -32,6 +40,9 @@ EXCLUDED_WEAPON_LABELS = {"explosion"}
 # Web UI
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
+WEB_DISPLAY_WIDTH = 960
+WEB_VIDEO_REFRESH_MS = 33
+WEB_STATUS_REFRESH_MS = 500
 ALERT_DIR = ROOT_DIR / "data" / "alerts"
 
 # 顯示視窗名稱
@@ -41,3 +52,14 @@ WINDOW_NAME = "危險人物即時識別"
 COLOR_DANGER = (0, 0, 255)
 COLOR_HAND = (255, 200, 0)
 COLOR_WEAPON = (0, 165, 255)
+
+
+def capture_backend() -> int:
+    """Windows 使用 DirectShow 以降低 webcam 延遲。"""
+    if sys.platform == "win32":
+        import cv2
+
+        return cv2.CAP_DSHOW
+    import cv2
+
+    return cv2.CAP_ANY

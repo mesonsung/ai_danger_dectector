@@ -55,6 +55,9 @@ def main() -> None:
     frame_idx = fps_count = 0
     last_hands, last_weapons, last_dangerous = [], [], []
     fps_timer, fps = time.time(), 0.0
+    timestamp_ms = 0
+    last_detect_at = 0.0
+    detect_interval = config.DETECTION_MIN_INTERVAL_MS / 1000
 
     logger.info("按 Q 退出" if not args.headless else "無 GUI 模式（Ctrl+C 退出）")
 
@@ -67,14 +70,19 @@ def main() -> None:
         fps_count += 1
         danger_this_frame = False
 
-        if frame_idx % config.DETECT_INTERVAL == 0:
-            last_hands, last_weapons, last_dangerous = detector.detect(frame)
+        now = time.time()
+        if now - last_detect_at >= detect_interval:
+            last_detect_at = now
+            timestamp_ms += 33
+            last_hands, last_weapons, last_dangerous = detector.detect(frame, timestamp_ms)
             for dp in last_dangerous:
                 danger_this_frame = True
                 logger.warning(
                     "危險: %s手持有 %s at hand=%s",
                     dp.hand.label, dp.weapon_labels, dp.hand.bbox,
                 )
+
+        danger_this_frame = len(last_dangerous) > 0
 
         elapsed = time.time() - fps_timer
         if elapsed >= 1.0:

@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 import config
 from hand_detector import HandDetection
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DetectionStatus:
     fps: float = 0.0
+    detect_fps: float = 0.0
     danger_count: int = 0
     danger_active: bool = False
     hands: int = 0
@@ -32,16 +34,18 @@ class DetectionStatus:
 
 def open_capture(source: str) -> cv2.VideoCapture:
     src = int(source) if source.isdigit() else source
-    cap = cv2.VideoCapture(src)
+    backend = config.capture_backend() if isinstance(src, int) else 0
+    cap = cv2.VideoCapture(src, backend) if backend else cv2.VideoCapture(src)
     if not cap.isOpened():
         raise RuntimeError(f"無法開啟視訊來源: {source}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAPTURE_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAPTURE_HEIGHT)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
 
 
 class CameraService:
-    """背景執行緒持續擷取影像、執行偵測並提供最新畫面"""
+    """擷取與偵測分離：擷取執行緒維持高 FPS，偵測執行緒非同步處理最新幀。"""
 
     def __init__(
         self,
@@ -53,32 +57,50 @@ class CameraService:
         self.detector = detector
         self.snapshot_dir = snapshot_dir
         self._lock = threading.Lock()
-        self._latest_jpeg: bytes | None = None
+        self._latest_frame_rgb: np.ndarray | None = None
+        self._frame_seq = 0
         self._status = DetectionStatus()
         self._running = False
-        self._thread: threading.Thread | None = None
+        self._capture_thread: threading.Thread | None = None
+        self._detect_thread: threading.Thread | None = None
+
+        self._pending_frame: np.ndarray | None = None
+        self._frame_event = threading.Event()
+        self._results_lock = threading.Lock()
+        self._last_hands: list[HandDetection] = []
+        self._last_weapons: list[WeaponDetection] = []
+        self._last_dangerous: list[DangerousPerson] = []
+        self._recent_alerts: list[str] = []
+        self._timestamp_ms = 0
 
     def start(self) -> None:
         if self._running:
             return
         self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        logger.info("攝影機服務已啟動")
+        self._detect_thread = threading.Thread(target=self._detect_loop, daemon=True)
+        self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._detect_thread.start()
+        self._capture_thread.start()
+        logger.info("攝影機服務已啟動（擷取/偵測分離）")
 
     def stop(self) -> None:
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=3)
+        self._frame_event.set()
+        for thread in (self._capture_thread, self._detect_thread):
+            if thread:
+                thread.join(timeout=3)
 
-    def get_jpeg(self) -> bytes | None:
+    def get_frame_rgb(self) -> tuple[np.ndarray | None, int]:
         with self._lock:
-            return self._latest_jpeg
+            if self._latest_frame_rgb is None:
+                return None, self._frame_seq
+            return self._latest_frame_rgb.copy(), self._frame_seq
 
     def get_status(self) -> DetectionStatus:
         with self._lock:
             return DetectionStatus(
                 fps=self._status.fps,
+                detect_fps=self._status.detect_fps,
                 danger_count=self._status.danger_count,
                 danger_active=self._status.danger_active,
                 hands=self._status.hands,
@@ -87,14 +109,79 @@ class CameraService:
                 updated_at=self._status.updated_at,
             )
 
-    def _loop(self) -> None:
+    def _submit_frame(self, frame: np.ndarray) -> None:
+        with self._results_lock:
+            self._pending_frame = frame
+        self._frame_event.set()
+
+    def _take_pending_frame(self) -> np.ndarray | None:
+        with self._results_lock:
+            frame = self._pending_frame
+            self._pending_frame = None
+        return frame
+
+    def _detect_loop(self) -> None:
+        detect_count = 0
+        detect_timer = time.time()
+        detect_fps = 0.0
+        min_interval = config.DETECTION_MIN_INTERVAL_MS / 1000
+
+        while self._running:
+            if not self._frame_event.wait(timeout=0.05):
+                continue
+            self._frame_event.clear()
+
+            frame = self._take_pending_frame()
+            while True:
+                with self._results_lock:
+                    newer = self._pending_frame
+                    if newer is not None:
+                        frame = newer
+                        self._pending_frame = None
+                    else:
+                        break
+
+            if frame is None:
+                continue
+
+            started = time.time()
+            self._timestamp_ms += 33
+            hands, weapons, dangerous = self.detector.detect(frame, self._timestamp_ms)
+
+            detect_count += 1
+            elapsed = time.time() - detect_timer
+            if elapsed >= 1.0:
+                detect_fps = detect_count / elapsed
+                detect_count = 0
+                detect_timer = time.time()
+
+            for dp in dangerous:
+                msg = f"{dp.hand.label}手持有 {dp.weapon_labels}"
+                logger.warning("危險: %s at %s", msg, dp.hand.bbox)
+                self._recent_alerts.insert(0, f"{datetime.now():%H:%M:%S} {msg}")
+                self._recent_alerts = self._recent_alerts[:20]
+
+            with self._results_lock:
+                self._last_hands = hands
+                self._last_weapons = weapons
+                self._last_dangerous = dangerous
+
+            with self._lock:
+                self._status.detect_fps = round(detect_fps, 1)
+                self._status.danger_count = len(dangerous)
+                self._status.hands = len(hands)
+                self._status.weapons = len(weapons)
+                self._status.alerts = list(self._recent_alerts)
+
+            spent = time.time() - started
+            if spent < min_interval:
+                time.sleep(min_interval - spent)
+
+    def _capture_loop(self) -> None:
         cap = open_capture(self.source)
-        frame_idx = fps_count = 0
-        last_hands: list[HandDetection] = []
-        last_weapons: list[WeaponDetection] = []
-        last_dangerous: list[DangerousPerson] = []
+        fps_count = 0
         fps_timer, fps = time.time(), 0.0
-        recent_alerts: list[str] = []
+        last_snapshot_at = 0.0
 
         try:
             while self._running:
@@ -104,18 +191,15 @@ class CameraService:
                     time.sleep(0.5)
                     continue
 
-                frame_idx += 1
                 fps_count += 1
-                danger_this_frame = False
+                self._submit_frame(frame)
 
-                if frame_idx % config.DETECT_INTERVAL == 0:
-                    last_hands, last_weapons, last_dangerous = self.detector.detect(frame)
-                    for dp in last_dangerous:
-                        danger_this_frame = True
-                        msg = f"{dp.hand.label}手持有 {dp.weapon_labels}"
-                        logger.warning("危險: %s at %s", msg, dp.hand.bbox)
-                        recent_alerts.insert(0, f"{datetime.now():%H:%M:%S} {msg}")
-                        recent_alerts = recent_alerts[:20]
+                with self._results_lock:
+                    hands = list(self._last_hands)
+                    weapons = list(self._last_weapons)
+                    dangerous = list(self._last_dangerous)
+
+                danger_active = len(dangerous) > 0
 
                 elapsed = time.time() - fps_timer
                 if elapsed >= 1.0:
@@ -124,30 +208,37 @@ class CameraService:
                     fps_timer = time.time()
 
                 status_text = (
-                    f"FPS: {fps:.1f} | 危險: {len(last_dangerous)} | "
+                    f"FPS: {fps:.1f} | 危險: {len(dangerous)} | "
                     f"{datetime.now():%H:%M:%S}"
                 )
-                render_frame(frame, last_hands, last_weapons, last_dangerous, status_text, danger_this_frame)
+                render_frame(frame, hands, weapons, dangerous, status_text, danger_active)
 
-                if danger_this_frame and self.snapshot_dir:
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                    path = self.snapshot_dir / f"alert_{ts}.jpg"
-                    cv2.imwrite(str(path), frame)
+                if danger_active and self.snapshot_dir:
+                    now = time.time()
+                    if now - last_snapshot_at >= 1.0:
+                        last_snapshot_at = now
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        path = self.snapshot_dir / f"alert_{ts}.jpg"
+                        cv2.imwrite(str(path), frame)
 
-                ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ok:
-                    with self._lock:
-                        self._latest_jpeg = jpeg.tobytes()
-                        self._status = DetectionStatus(
-                            fps=round(fps, 1),
-                            danger_count=len(last_dangerous),
-                            danger_active=danger_this_frame,
-                            hands=len(last_hands),
-                            weapons=len(last_weapons),
-                            alerts=recent_alerts,
-                            updated_at=datetime.now().isoformat(timespec="seconds"),
-                        )
+                h, w = frame.shape[:2]
+                display_w = config.WEB_DISPLAY_WIDTH
+                if w > display_w:
+                    scale = display_w / w
+                    display = cv2.resize(
+                        frame,
+                        (display_w, int(h * scale)),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    display = frame
+                rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
 
-                time.sleep(0.001)
+                with self._lock:
+                    self._latest_frame_rgb = rgb
+                    self._frame_seq += 1
+                    self._status.fps = round(fps, 1)
+                    self._status.danger_active = danger_active
+                    self._status.updated_at = datetime.now().isoformat(timespec="seconds")
         finally:
             cap.release()
