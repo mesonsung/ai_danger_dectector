@@ -1,0 +1,83 @@
+services:
+  detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-object-reg
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    devices:
+      - ${VIDEO_DEVICE:-/dev/video0}:/dev/video0
+    group_add:
+      - video
+    volumes:
+      - ./models:/app/models
+      - ./data/alerts:/app/data/alerts
+    environment:
+      - VIDEO_SOURCE=${VIDEO_SOURCE:-/dev/video0}
+      - DETECTION_CONF=${DETECTION_CONF:-0.4}
+    command:
+      - --source
+      - ${VIDEO_SOURCE:-/dev/video0}
+      - --weapon-model
+      - /app/models/weapon.pt
+      - --hand-model
+      - /app/models/hand_landmarker.task
+      - --conf
+      - ${DETECTION_CONF:-0.4}
+      - --snapshot-dir
+      - /app/data/alerts
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  detector-gpu:
+    profiles:
+      - gpu
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-object-reg-gpu
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    devices:
+      - ${VIDEO_DEVICE:-/dev/video0}:/dev/video0
+    group_add:
+      - video
+    volumes:
+      - ./models:/app/models
+      - ./data/alerts:/app/data/alerts
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - VIDEO_SOURCE=${VIDEO_SOURCE:-/dev/video0}
+      - DETECTION_CONF=${DETECTION_CONF:-0.4}
+    command:
+      - --source
+      - ${VIDEO_SOURCE:-/dev/video0}
+      - --weapon-model
+      - /app/models/weapon.pt
+      - --hand-model
+      - /app/models/hand_landmarker.task
+      - --conf
+      - ${DETECTION_CONF:-0.4}
+      - --snapshot-dir
+      - /app/data/alerts
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
