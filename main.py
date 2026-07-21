@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import cv2
 
 import config
-from camera_service import open_capture
+from camera_service import CameraService
 from object_detector import ObjectDetector
-from overlay import render_frame
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,63 +48,32 @@ def main() -> None:
         auto_download=not args.no_download,
     )
 
-    cap = open_capture(args.source)
-    frame_idx = fps_count = 0
-    last_hands, last_weapons, last_dangerous = [], [], []
-    fps_timer, fps = time.time(), 0.0
-    timestamp_ms = 0
-    last_detect_at = 0.0
-    detect_interval = config.DETECTION_MIN_INTERVAL_MS / 1000
+    service = CameraService(args.source, detector, snapshot_dir)
+    service.start()
 
     logger.info("按 Q 退出" if not args.headless else "無 GUI 模式（Ctrl+C 退出）")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    last_frame_seq = -1
+    try:
+        while True:
+            frame, frame_seq = service.get_frame_bgr()
+            if frame is not None and frame_seq != last_frame_seq:
+                last_frame_seq = frame_seq
+                if not args.headless:
+                    cv2.imshow(config.WINDOW_NAME, frame)
 
-        frame_idx += 1
-        fps_count += 1
-        danger_this_frame = False
+            if args.headless:
+                time.sleep(0.01)
+                continue
 
-        now = time.time()
-        if now - last_detect_at >= detect_interval:
-            last_detect_at = now
-            timestamp_ms += 33
-            last_hands, last_weapons, last_dangerous = detector.detect(frame, timestamp_ms)
-            for dp in last_dangerous:
-                danger_this_frame = True
-                logger.warning(
-                    "危險: %s手持有 %s at hand=%s",
-                    dp.hand.label, dp.weapon_labels, dp.hand.bbox,
-                )
-
-        danger_this_frame = len(last_dangerous) > 0
-
-        elapsed = time.time() - fps_timer
-        if elapsed >= 1.0:
-            fps = fps_count / elapsed
-            fps_count = 0
-            fps_timer = time.time()
-
-        status = f"FPS: {fps:.1f} | 危險: {len(last_dangerous)} | {datetime.now():%H:%M:%S}"
-        render_frame(frame, last_hands, last_weapons, last_dangerous, status, danger_this_frame)
-
-        if danger_this_frame and snapshot_dir:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            cv2.imwrite(str(snapshot_dir / f"alert_{ts}.jpg"), frame)
-
-        if args.headless:
-            time.sleep(0.01)
-            continue
-
-        cv2.imshow(config.WINDOW_NAME, frame)
-        if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
-            break
-
-    cap.release()
-    if not args.headless:
-        cv2.destroyAllWindows()
+            if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        service.stop()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

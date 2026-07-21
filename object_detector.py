@@ -1,8 +1,10 @@
-"""危險物品偵測與手部空間關聯"""
+"""危險物品偵測與手部 segmentation 空間關聯"""
 
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from ultralytics import YOLO
 from config import (
     DETECTION_MAX_WIDTH,
     EXCLUDED_WEAPON_LABELS,
-    HAND_WEAPON_IOU_THRESHOLD,
+    HAND_WEAPON_MASK_OVERLAP_THRESHOLD,
     WEAPON_IMGSZ,
 )
 from hand_detector import HandDetection, HandDetector
@@ -27,6 +29,7 @@ class WeaponDetection:
     label: str
     confidence: float
     bbox: tuple[int, int, int, int]
+    mask: np.ndarray | None = None  # bool H×W，與推論影像同尺寸
 
 
 @dataclass
@@ -41,17 +44,21 @@ class DangerousPerson:
         return ", ".join(w.label for w in self.weapons)
 
 
-def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
-    x1 = max(a[0], b[0])
-    y1 = max(a[1], b[1])
-    x2 = min(a[2], b[2])
-    y2 = min(a[3], b[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
+def _mask_overlap(a: np.ndarray, b: np.ndarray) -> float:
+    """intersection / min(area)，衡量 mask 是否實質重疊。"""
+    inter = int(np.logical_and(a, b).sum())
     if inter == 0:
         return 0.0
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
-    return inter / (area_a + area_b - inter)
+    area_a = int(a.sum())
+    area_b = int(b.sum())
+    return inter / min(area_a, area_b)
+
+
+def _bbox_to_mask(bbox: tuple[int, int, int, int], height: int, width: int) -> np.ndarray:
+    x1, y1, x2, y2 = bbox
+    mask = np.zeros((height, width), dtype=bool)
+    mask[y1:y2, x1:x2] = True
+    return mask
 
 
 def _scale_bbox(bbox: tuple[int, int, int, int], inv_scale: float) -> tuple[int, int, int, int]:
@@ -67,7 +74,7 @@ def _scale_bbox(bbox: tuple[int, int, int, int], inv_scale: float) -> tuple[int,
 
 
 class ObjectDetector:
-    """偵測手部與危險物品，以 bounding box 重疊判斷是否手持"""
+    """偵測手部與危險物品，以 segmentation mask 重疊判斷是否手持"""
 
     def __init__(
         self,
@@ -86,11 +93,24 @@ class ObjectDetector:
         self.weapon_model = YOLO(str(weapon_path))
         self.hand_detector = HandDetector(str(hand_path), min_confidence=conf)
         self.conf = conf
+        self._weapon_has_masks = self.weapon_model.task == "segment"
         self._device = self._resolve_device()
-        logger.info("YOLO 推論裝置: %s", self._device)
+        self.infer_device_label = self._device_label(self._device)
+        self.weapon_model.to(self._device)
+        self._infer_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="detect")
+        self._warmup()
+        logger.info("YOLO 推論裝置: %s", self.infer_device_label)
+        if self._weapon_has_masks:
+            logger.info("危險物品模型支援 instance segmentation")
+        else:
+            logger.info("危險物品模型為 detect 模式，武器 mask 以 bbox 近似")
 
     @staticmethod
     def _resolve_device() -> str | int:
+        forced = os.environ.get("INFER_DEVICE", "").strip()
+        if forced:
+            return forced
+
         try:
             import torch
 
@@ -99,6 +119,33 @@ class ObjectDetector:
         except ImportError:
             pass
         return "cpu"
+
+    @staticmethod
+    def _device_label(device: str | int) -> str:
+        if device == "cpu":
+            return "CPU"
+        try:
+            import torch
+
+            if isinstance(device, int) and torch.cuda.is_available():
+                return torch.cuda.get_device_name(device)
+        except ImportError:
+            pass
+        return str(device)
+
+    def _warmup(self) -> None:
+        dummy = np.zeros((WEAPON_IMGSZ, WEAPON_IMGSZ, 3), dtype=np.uint8)
+        self.weapon_model(
+            dummy,
+            conf=self.conf,
+            imgsz=WEAPON_IMGSZ,
+            device=self._device,
+            verbose=False,
+        )
+        if self._device != "cpu":
+            import torch
+
+            torch.cuda.synchronize()
 
     def _prepare_infer_frame(self, frame: np.ndarray) -> tuple[np.ndarray, float]:
         h, w = frame.shape[:2]
@@ -113,7 +160,24 @@ class ObjectDetector:
             return infer, scale
         return frame, 1.0
 
-    def _detect_weapons(self, frame: np.ndarray, inv_scale: float) -> list[WeaponDetection]:
+    def _extract_weapon_mask(
+        self,
+        result,
+        box_index: int,
+        bbox: tuple[int, int, int, int],
+        height: int,
+        width: int,
+    ) -> np.ndarray:
+        if self._weapon_has_masks and result.masks is not None:
+            mask_data = result.masks.data[box_index]
+            if hasattr(mask_data, "cpu"):
+                mask_data = mask_data.cpu().numpy()
+            mask = cv2.resize(mask_data, (width, height), interpolation=cv2.INTER_NEAREST)
+            return mask > 0.5
+        return _bbox_to_mask(bbox, height, width)
+
+    def _detect_weapons(self, frame: np.ndarray) -> list[WeaponDetection]:
+        height, width = frame.shape[:2]
         results = self.weapon_model(
             frame,
             conf=self.conf,
@@ -126,15 +190,18 @@ class ObjectDetector:
             if result.boxes is None:
                 continue
             names = result.names
-            for box in result.boxes:
+            for box_index, box in enumerate(result.boxes):
                 cls_id = int(box.cls[0])
                 label = names.get(cls_id, str(cls_id))
                 if label.lower() in EXCLUDED_WEAPON_LABELS:
                     continue
                 conf = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                bbox = _scale_bbox((x1, y1, x2, y2), inv_scale)
-                weapons.append(WeaponDetection(label=label, confidence=conf, bbox=bbox))
+                bbox = (x1, y1, x2, y2)
+                mask = self._extract_weapon_mask(result, box_index, bbox, height, width)
+                weapons.append(
+                    WeaponDetection(label=label, confidence=conf, bbox=bbox, mask=mask),
+                )
         return weapons
 
     def detect(
@@ -145,7 +212,15 @@ class ObjectDetector:
         infer_frame, scale = self._prepare_infer_frame(frame)
         inv_scale = 1.0 / scale
 
-        hands = self.hand_detector.detect(infer_frame, timestamp_ms)
+        hand_future = self._infer_pool.submit(
+            self.hand_detector.detect, infer_frame, timestamp_ms,
+        )
+        weapon_future = self._infer_pool.submit(self._detect_weapons, infer_frame)
+        hands = hand_future.result()
+        weapons = weapon_future.result()
+
+        dangerous = self._match_hand_weapon(hands, weapons)
+
         if inv_scale != 1.0:
             hands = [
                 HandDetection(
@@ -155,9 +230,33 @@ class ObjectDetector:
                 )
                 for hand in hands
             ]
+            weapons = [
+                WeaponDetection(
+                    label=weapon.label,
+                    confidence=weapon.confidence,
+                    bbox=_scale_bbox(weapon.bbox, inv_scale),
+                )
+                for weapon in weapons
+            ]
+            dangerous = [
+                DangerousPerson(
+                    hand=HandDetection(
+                        label=dp.hand.label,
+                        confidence=dp.hand.confidence,
+                        bbox=_scale_bbox(dp.hand.bbox, inv_scale),
+                    ),
+                    weapons=[
+                        WeaponDetection(
+                            label=weapon.label,
+                            confidence=weapon.confidence,
+                            bbox=_scale_bbox(weapon.bbox, inv_scale),
+                        )
+                        for weapon in dp.weapons
+                    ],
+                )
+                for dp in dangerous
+            ]
 
-        weapons = self._detect_weapons(infer_frame, inv_scale)
-        dangerous = self._match_hand_weapon(hands, weapons)
         return hands, weapons, dangerous
 
     def _match_hand_weapon(
@@ -168,11 +267,15 @@ class ObjectDetector:
         if not hands or not weapons:
             return []
 
+        threshold = HAND_WEAPON_MASK_OVERLAP_THRESHOLD
         dangerous: list[DangerousPerson] = []
         for hand in hands:
+            if hand.mask is None:
+                continue
             matched = [
                 weapon for weapon in weapons
-                if _iou(hand.bbox, weapon.bbox) >= HAND_WEAPON_IOU_THRESHOLD
+                if weapon.mask is not None
+                and _mask_overlap(hand.mask, weapon.mask) >= threshold
             ]
             if matched:
                 dangerous.append(DangerousPerson(hand=hand, weapons=matched))

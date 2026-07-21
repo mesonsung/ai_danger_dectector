@@ -28,6 +28,7 @@ class DetectionStatus:
     danger_active: bool = False
     hands: int = 0
     weapons: int = 0
+    infer_device: str = "cpu"
     alerts: list[str] = field(default_factory=list)
     updated_at: str = ""
 
@@ -38,9 +39,28 @@ def open_capture(source: str) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(src, backend) if backend else cv2.VideoCapture(src)
     if not cap.isOpened():
         raise RuntimeError(f"無法開啟視訊來源: {source}")
+
+    if isinstance(src, int) and config.CAPTURE_FOURCC:
+        fourcc = cv2.VideoWriter_fourcc(*config.CAPTURE_FOURCC)
+        cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAPTURE_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAPTURE_HEIGHT)
+    if config.CAPTURE_FPS:
+        cap.set(cv2.CAP_PROP_FPS, config.CAPTURE_FPS)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fourcc_str = "".join(chr((actual_fourcc >> 8 * i) & 0xFF) for i in range(4))
+    logger.info(
+        "視訊來源: %sx%s fourcc=%s fps=%s",
+        actual_w,
+        actual_h,
+        fourcc_str,
+        cap.get(cv2.CAP_PROP_FPS),
+    )
     return cap
 
 
@@ -58,6 +78,7 @@ class CameraService:
         self.snapshot_dir = snapshot_dir
         self._lock = threading.Lock()
         self._latest_frame_rgb: np.ndarray | None = None
+        self._latest_frame_bgr: np.ndarray | None = None
         self._frame_seq = 0
         self._status = DetectionStatus()
         self._running = False
@@ -70,8 +91,10 @@ class CameraService:
         self._last_hands: list[HandDetection] = []
         self._last_weapons: list[WeaponDetection] = []
         self._last_dangerous: list[DangerousPerson] = []
+        self._prev_danger_active = False
         self._recent_alerts: list[str] = []
         self._timestamp_ms = 0
+        self._infer_device = detector.infer_device_label
 
     def start(self) -> None:
         if self._running:
@@ -96,6 +119,12 @@ class CameraService:
                 return None, self._frame_seq
             return self._latest_frame_rgb.copy(), self._frame_seq
 
+    def get_frame_bgr(self) -> tuple[np.ndarray | None, int]:
+        with self._lock:
+            if self._latest_frame_bgr is None:
+                return None, self._frame_seq
+            return self._latest_frame_bgr.copy(), self._frame_seq
+
     def get_status(self) -> DetectionStatus:
         with self._lock:
             return DetectionStatus(
@@ -105,6 +134,7 @@ class CameraService:
                 danger_active=self._status.danger_active,
                 hands=self._status.hands,
                 weapons=self._status.weapons,
+                infer_device=self._infer_device,
                 alerts=list(self._status.alerts),
                 updated_at=self._status.updated_at,
             )
@@ -155,11 +185,14 @@ class CameraService:
                 detect_count = 0
                 detect_timer = time.time()
 
-            for dp in dangerous:
-                msg = f"{dp.hand.label}手持有 {dp.weapon_labels}"
-                logger.warning("危險: %s at %s", msg, dp.hand.bbox)
-                self._recent_alerts.insert(0, f"{datetime.now():%H:%M:%S} {msg}")
-                self._recent_alerts = self._recent_alerts[:20]
+            danger_active = len(dangerous) > 0
+            if danger_active and not self._prev_danger_active:
+                for dp in dangerous:
+                    msg = f"{dp.hand.label}手持有 {dp.weapon_labels}"
+                    logger.warning("危險: %s at %s", msg, dp.hand.bbox)
+                    self._recent_alerts.insert(0, f"{datetime.now():%H:%M:%S} {msg}")
+                    self._recent_alerts = self._recent_alerts[:20]
+            self._prev_danger_active = danger_active
 
             with self._results_lock:
                 self._last_hands = hands
@@ -208,7 +241,8 @@ class CameraService:
                     fps_timer = time.time()
 
                 status_text = (
-                    f"FPS: {fps:.1f} | 危險: {len(dangerous)} | "
+                    f"FPS: {fps:.1f} | 偵測: {self._status.detect_fps:.1f} | "
+                    f"GPU: {self._infer_device} | 危險: {len(dangerous)} | "
                     f"{datetime.now():%H:%M:%S}"
                 )
                 render_frame(frame, hands, weapons, dangerous, status_text, danger_active)
@@ -235,6 +269,7 @@ class CameraService:
                 rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
 
                 with self._lock:
+                    self._latest_frame_bgr = display.copy()
                     self._latest_frame_rgb = rgb
                     self._frame_seq += 1
                     self._status.fps = round(fps, 1)

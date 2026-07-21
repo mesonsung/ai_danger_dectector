@@ -156,7 +156,9 @@ def run_ui(args: argparse.Namespace) -> None:
                     badge_slot.success("監控中", icon="✅")
 
             fps_metric.metric("FPS", f"{status.fps:.1f}")
-            detect_fps_label.caption(f"偵測 {status.detect_fps:.1f} FPS")
+            detect_fps_label.caption(
+                f"偵測 {status.detect_fps:.1f} FPS · {status.infer_device}",
+            )
             danger_metric.metric("危險事件", status.danger_count)
             hands_metric.metric("手部", status.hands)
             weapons_metric.metric("危險物品", status.weapons)

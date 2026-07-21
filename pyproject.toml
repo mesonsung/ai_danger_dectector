@@ -11,10 +11,27 @@ dependencies = [
     "mediapipe>=0.10.0",
     "huggingface-hub>=0.20.0",
     "streamlit>=1.33.0",
+    "torch>=2.0",
+    "torchvision>=0.15",
 ]
 
 [dependency-groups]
-dev = []
+dev = [
+    "roboflow>=1.1.0",
+]
 
 [tool.uv]
 package = false
+override-dependencies = [
+    # streamlit 會拉入 headless 版，覆蓋 cv2 導致 imshow 不可用
+    "opencv-python-headless; sys_platform == 'never'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }

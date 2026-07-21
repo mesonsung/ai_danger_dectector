@@ -4,9 +4,9 @@
 
 ## 偵測原理
 
-1. **手部偵測**：MediaPipe Hand Landmarker 計算手部 bounding box
+1. **手部偵測**：MediaPipe Hand Landmarker 以 landmark 凸包建立手部 **segmentation mask**
 2. **危險物品偵測**：公開 YOLO 模型（Hugging Face）偵測刀、槍等
-3. **空間關聯**：危險物品 bbox 與手部 bbox **IoU 重疊** → 判定為危險
+3. **空間關聯**：手部 mask 與危險物品 mask **像素重疊** → 判定為危險（若 YOLO 為 detect 模型，武器 mask 以 bbox 近似；可替換為 YOLO-seg 模型以取得更精準輪廓）
 
 ## Web UI 啟動（Streamlit）
 
@@ -64,3 +64,7 @@ uv run python web_app.py --snapshot-dir data/alerts
 | 手部 | [MediaPipe Hand Landmarker](https://developers.google.com/mediapipe/solutions/vision/hand_landmarker) |
 
 首次執行自動下載至 `models/`。
+
+## Fine-tune 武器 Segmentation 模型
+
+訓練腳本、資料集與輸出位於 [`model-training/`](model-training/README.md) 目錄。詳細步驟請參閱該目錄下的 README。

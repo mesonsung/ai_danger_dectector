@@ -54,9 +54,10 @@ def draw_status_bar(frame, status: str, danger: bool) -> None:
 
 def draw_alert_banner(frame) -> None:
     h, w = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, h - 60), (w, h), config.COLOR_DANGER, -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    y0 = h - 60
+    banner = frame[y0:h, 0:w].copy()
+    cv2.rectangle(banner, (0, 0), (w, 60), config.COLOR_DANGER, -1)
+    cv2.addWeighted(banner, 0.7, frame[y0:h, 0:w], 0.3, 0, frame[y0:h, 0:w])
     cv2.putText(
         frame, "!!! 偵測到手持危險物品 !!!", (w // 2 - 240, h - 20),
         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA,
